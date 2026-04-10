@@ -385,6 +385,40 @@ def plot_comparison(all_results, save_path):
     plt.close(fig)
 
 
+def plot_holding_frequency(result, save_path):
+    """Generates and saves a bar chart of the B1 holding frequencies."""
+    freq, n_periods = result.holding_frequency()
+    if not freq:
+        return
+
+    sorted_freq = freq.most_common()
+    countries = [x[0] for x in sorted_freq][::-1]
+    counts = [x[1] for x in sorted_freq][::-1]
+    percentages = [c / n_periods for c in counts]
+
+    fig, ax = plt.subplots(figsize=(10, max(6, len(countries) * 0.3)))
+    
+    ax.barh(countries, percentages, color=PALETTE["darkblue"], alpha=0.75)
+    ax.set_title(f"B1 Holdings Frequency: {result.factor_label} ({result.rebal_freq.title()})", 
+                 fontsize=14, fontweight="bold", color=PALETTE["darkblue"])
+    ax.set_xlabel(f"Frequency in Top Bucket (Total periods: {n_periods})")
+    ax.xaxis.set_major_formatter(mticker.PercentFormatter(1.0))
+
+    # Explicitly disable gridlines in case the global style applies them
+    ax.grid(False)
+
+    # Add text labels next to the bars (percentage only)
+    for i, pct in enumerate(percentages):
+        ax.text(pct + 0.01, i, f"{pct:.1%}", va='center', fontsize=9)
+
+    # Expand x-axis slightly so the text doesn't get cut off
+    ax.set_xlim(0, max(percentages) * 1.15 if percentages else 1.0)
+
+    plt.tight_layout()
+    fig.savefig(str(save_path), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 # =========================================================================
 # Main
 # =========================================================================
@@ -438,6 +472,10 @@ def main():
                       f"€{s['Total Cost EUR']:,.0f}")
 
                 plot_strategy(result, OUTPUT_DIR / f"{fid}_{freq}.png")
+
+                # Export holding frequency charts for monthly strategies
+                if freq == "monthly":
+                    plot_holding_frequency(result, OUTPUT_DIR / f"{fid}_monthly_holdings.png")
 
             except RuntimeError as e:
                 print(f"FAILED: {e}")
@@ -509,14 +547,10 @@ def main():
         print(f"  {label:<30s}  {fmt(ms)}  |  {fmt(qs)}")
 
     # ---- Holdings frequency ----------------------------------------------
-    print("\n\n--- B1 HOLDINGS FREQUENCY (top 4 quarterly strategies by IR) ---\n")
-    q_results = sorted(
-        [r for r in all_results if r.rebal_freq == "quarterly"],
-        key=lambda r: (r.summary().get("Information Ratio") or -999),
-        reverse=True,
-    )[:4]
+    print("\n\n--- B1 HOLDINGS FREQUENCY (All Monthly Strategies) ---\n")
+    m_results = [r for r in all_results if r.rebal_freq == "monthly"]
 
-    for r in q_results:
+    for r in m_results:
         freq, n_periods = r.holding_frequency()
         print(f"  {r.factor_label}:")
         for country, count in freq.most_common():
@@ -533,6 +567,7 @@ def main():
     print(f"  strategy_comparison.csv         — comparison table")
     print(f"  all_strategies_comparison.png   — aligned equity curves")
     print(f"  <factor>_<freq>.png             — individual strategy panels")
+    print(f"  <factor>_monthly_holdings.png   — holding frequency bar charts")
 
 
 if __name__ == "__main__":
