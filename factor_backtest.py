@@ -1,22 +1,23 @@
 """
-Emerging Markets Country-Level Factor Quintile Sort Backtester
-==============================================================
+Emerging Markets Country-Level Factor Backtester (daily, long-only focus)
+==========================================================================
 
 Methodology:
-    Each period t, rank all countries by a factor signal observed at t,
-    assign to N equal-sized buckets. Bucket 1 = most attractive.
-    Measure each bucket's equal-weighted return over month t+1.
-    Repeat every month.
+    1. Factor signals are observed monthly (one per country per month-end).
+    2. At each factor date t, rank countries and assign to N buckets.
+    3. Hold each bucket from the trading day after t until the next factor date.
+    4. Bucket equity curves are computed from DAILY country price returns
+       (equal-weighted, daily rebalanced within each holding period).
+    5. Stats (Sharpe, vol, drawdowns) are computed from daily returns,
+       annualised using 252 trading days.
 
-Temporal alignment:
-    factor observed at date t → forward return = the return measured at
-    the NEXT available return date after t.  This ensures no look-ahead
-    bias: we rank on information available today and measure what happens
-    next month.
+Temporal alignment (no look-ahead):
+    Factor at date t  →  determines holdings starting the next trading day
+    Holdings held until the next trading day after the next factor date
 
-Expected CSV formats:
-    Factor:   date, country, factor_value
-    Returns:  date, country, return   (simple monthly return, e.g. 0.03 = +3%)
+Long-only focus:
+    Bucket 1 = most attractive countries (controlled by `higher_is_better`)
+    Reports B1 vs MSCI EM benchmark (not L/S spread)
 """
 
 import pandas as pd
@@ -24,25 +25,52 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Union, List, Set, Dict
 from pathlib import Path
 
 
 # =========================================================================
-# Chart style — presentation quality
+# Country mapping (Bloomberg ticker → readable name)
+# =========================================================================
+
+COUNTRY_TICKERS = {
+    "M1CNA Index":  "China",
+    "MXIN Index":   "India",
+    "MXKR Index":   "South Korea",
+    "TAMSCI Index": "Taiwan",
+    "MXID Index":   "Indonesia",
+    "MXMY Index":   "Malaysia",
+    "MXTH Index":   "Thailand",
+    "MXPH Index":   "Philippines",
+    "MXBR Index":   "Brazil",
+    "MXMX Index":   "Mexico",
+    "MXZA Index":   "South Africa",
+    "MXTR Index":   "Turkey",
+    "MXGR Index":   "Greece",
+    "MXPL Index":   "Poland",
+    "MXSA Index":   "Saudi Arabia",
+}
+
+BENCHMARK_TICKER = "MIMUEMRN Index"
+BENCHMARK_NAME   = "MSCI EM"
+
+
+# =========================================================================
+# Chart style
 # =========================================================================
 
 PALETTE = {
-    "green":    "#2ecc71",
-    "lime":     "#82e0aa",
-    "yellow":   "#f4d03f",
-    "orange":   "#e67e22",
-    "red":      "#e74c3c",
-    "blue":     "#2980b9",
-    "darkblue": "#1a5276",
-    "grey":     "#7f8c8d",
-    "lightgrey":"#bdc3c7",
-    "bg":       "#fafafa",
+    "green":     "#2ecc71",
+    "lime":      "#82e0aa",
+    "yellow":    "#f4d03f",
+    "orange":    "#e67e22",
+    "red":       "#e74c3c",
+    "blue":      "#2980b9",
+    "darkblue":  "#1a5276",
+    "grey":      "#7f8c8d",
+    "lightgrey": "#bdc3c7",
+    "bg":        "#fafafa",
+    "benchmark": "#2c3e50",
 }
 
 BUCKET_COLORS = [
@@ -50,8 +78,8 @@ BUCKET_COLORS = [
     PALETTE["orange"], PALETTE["red"],
 ]
 
+
 def apply_chart_style():
-    """Set global matplotlib style for presentation-quality output."""
     plt.rcParams.update({
         "figure.facecolor":   "white",
         "axes.facecolor":     PALETTE["bg"],
@@ -70,7 +98,156 @@ def apply_chart_style():
         "ytick.labelsize":    9,
     })
 
+
 apply_chart_style()
+
+
+# =========================================================================
+# Daily price data loading
+# =========================================================================
+
+def load_daily_prices(csv_path):
+    """
+    Load daily prices and benchmark from EM_Indices_EUR.csv.
+
+    Returns
+    -------
+    country_prices : DataFrame
+        Daily prices indexed by date, columns = country names
+    benchmark_prices : Series or None
+        Daily MSCI EM prices (or None if not in file)
+    """
+    df = pd.read_csv(csv_path)
+    df.columns = [c.strip() for c in df.columns]
+    df = df.rename(columns={df.columns[0]: 'date'})
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.set_index('date').sort_index()
+
+    rename_map = {}
+    for ticker, country in COUNTRY_TICKERS.items():
+        if ticker in df.columns:
+            rename_map[ticker] = country
+        else:
+            ticker_dot = ticker.replace(' ', '.')
+            if ticker_dot in df.columns:
+                rename_map[ticker_dot] = country
+
+    if not rename_map:
+        raise ValueError(
+            f"No country tickers found in {csv_path}. "
+            f"First 5 columns: {list(df.columns[:5])}"
+        )
+
+    country_prices = df[list(rename_map.keys())].rename(columns=rename_map)
+
+    benchmark_prices = None
+    for variant in [BENCHMARK_TICKER, BENCHMARK_TICKER.replace(' ', '.')]:
+        if variant in df.columns:
+            benchmark_prices = df[variant].rename(BENCHMARK_NAME)
+            break
+
+    return country_prices, benchmark_prices
+
+
+def portfolio_daily_returns(daily_returns_df, holdings_history, daily_costs=None):
+    """
+    Compute daily portfolio returns from a holdings history.
+
+    holdings_history : list of (start_date, end_date_exclusive, set_of_countries)
+    daily_costs : dict {date: cost_pct} - subtracted from that day's return
+
+    Equal-weighted across held countries each day (daily rebalanced).
+    """
+    period_returns_list = []
+
+    for start, end, holdings in holdings_history:
+        if end is None:
+            mask = daily_returns_df.index >= start
+        else:
+            mask = (daily_returns_df.index >= start) & (daily_returns_df.index < end)
+
+        period_data = daily_returns_df.loc[mask]
+        if period_data.empty or not holdings:
+            continue
+
+        held_cols = [c for c in holdings if c in period_data.columns]
+        if not held_cols:
+            continue
+
+        # Equal-weighted across countries (skipna handles missing prices)
+        port_ret = period_data[held_cols].mean(axis=1, skipna=True)
+        period_returns_list.append(port_ret)
+
+    if not period_returns_list:
+        return pd.Series(dtype=float)
+
+    combined = pd.concat(period_returns_list).sort_index()
+    combined = combined[~combined.index.duplicated(keep='first')]
+
+    if daily_costs:
+        for cost_date, cost_pct in daily_costs.items():
+            if cost_date in combined.index:
+                combined.loc[cost_date] -= cost_pct
+            else:
+                next_dates = combined.index[combined.index >= cost_date]
+                if len(next_dates) > 0:
+                    combined.loc[next_dates[0]] -= cost_pct
+
+    return combined
+
+
+def annualised_stats(daily_returns, periods_per_year=252):
+    """Compute annualised stats from daily returns."""
+    s = daily_returns.dropna()
+    if len(s) == 0:
+        return {}
+
+    ann_ret = (1 + s.mean()) ** periods_per_year - 1
+    ann_vol = s.std() * np.sqrt(periods_per_year)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
+    cum = (1 + s).cumprod()
+    max_dd = (cum / cum.cummax() - 1).min()
+
+    return {
+        "Ann Return": ann_ret,
+        "Ann Vol": ann_vol,
+        "Sharpe": sharpe,
+        "Max DD": max_dd,
+        "Total Return": cum.iloc[-1] - 1,
+        "Hit Rate": (s > 0).mean(),
+        "Days": len(s),
+    }
+
+
+def align_to_common_start(curves):
+    """
+    Align multiple equity curves to a common start date.
+    Each curve is rebased to 1.0 at the latest first valid date.
+    """
+    if not curves:
+        return curves
+
+    first_dates = []
+    for c in curves.values():
+        valid = c.dropna()
+        if len(valid) > 0:
+            first_dates.append(valid.index[0])
+
+    if not first_dates:
+        return curves
+
+    common_start = max(first_dates)
+
+    aligned = {}
+    for name, curve in curves.items():
+        truncated = curve[curve.index >= common_start].dropna()
+        if len(truncated) == 0:
+            continue
+        first_val = truncated.iloc[0]
+        if first_val > 0:
+            aligned[name] = truncated / first_val
+
+    return aligned
 
 
 # =========================================================================
@@ -81,9 +258,9 @@ apply_chart_style()
 class BacktestConfig:
     n_buckets: int = 5
     higher_is_better: bool = False
-    min_countries: int = 10      # need ≥2 per bucket for meaningful sort
+    min_countries: int = 10
     factor_name: str = "Factor"
-    annualisation_factor: int = 12
+    periods_per_year: int = 252
 
 
 # =========================================================================
@@ -91,59 +268,91 @@ class BacktestConfig:
 # =========================================================================
 
 class BacktestResult:
-    def __init__(self, bucket_returns, bucket_assignments, config, skipped_dates):
-        self.bucket_returns = bucket_returns
+    def __init__(self, bucket_assignments, daily_bucket_returns,
+                 benchmark_daily_returns, config, skipped_dates=None):
         self.bucket_assignments = bucket_assignments
+        self.daily_bucket_returns = daily_bucket_returns
+        self.benchmark_daily_returns = benchmark_daily_returns
         self.config = config
-        self.skipped_dates = skipped_dates
+        self.skipped_dates = skipped_dates or []
 
-        self.cumulative = (1 + self.bucket_returns).cumprod()
-        self.long_short = (
-            self.bucket_returns.iloc[:, 0] - self.bucket_returns.iloc[:, -1]
-        )
-        self.long_short.name = f"L/S (B1 − B{config.n_buckets})"
-        self.cum_long_short = (1 + self.long_short).cumprod()
+        # Equity curves
+        self.bucket_equity = (1 + daily_bucket_returns.fillna(0)).cumprod()
 
-    def summary_table(self) -> pd.DataFrame:
-        af = self.config.annualisation_factor
+        if benchmark_daily_returns is not None:
+            bm_aligned = benchmark_daily_returns.reindex(daily_bucket_returns.index)
+            self.benchmark_equity = (1 + bm_aligned.fillna(0)).cumprod()
+        else:
+            self.benchmark_equity = None
 
-        def _row(series, label):
-            ann_ret = (1 + series.mean()) ** af - 1
-            ann_vol = series.std() * np.sqrt(af)
-            sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
-            hit = (series > 0).mean()
-            cum = (1 + series).cumprod()
-            max_dd = (cum / cum.cummax() - 1).min()
-            return {
-                "Bucket": label, "Ann. Return": ann_ret, "Ann. Vol": ann_vol,
-                "Sharpe": sharpe, "Hit Rate": hit, "Max DD": max_dd,
-                "Periods": len(series),
-            }
+    def summary_table(self):
+        """Per-bucket annualised stats, plus benchmark row."""
+        rows = []
+        for col in self.daily_bucket_returns.columns:
+            s = annualised_stats(
+                self.daily_bucket_returns[col],
+                self.config.periods_per_year,
+            )
+            s["Bucket"] = col
+            rows.append(s)
 
-        rows = [_row(self.bucket_returns[c], c) for c in self.bucket_returns.columns]
-        rows.append(_row(self.long_short, self.long_short.name))
+        if self.benchmark_daily_returns is not None:
+            bm_aligned = self.benchmark_daily_returns.reindex(
+                self.daily_bucket_returns.index)
+            bm_stats = annualised_stats(bm_aligned, self.config.periods_per_year)
+            bm_stats["Bucket"] = BENCHMARK_NAME
+            rows.append(bm_stats)
+
         return pd.DataFrame(rows).set_index("Bucket")
 
-    def monotonicity_score(self) -> float:
-        means = self.bucket_returns.mean()
+    def b1_excess_stats(self):
+        """B1 performance vs benchmark."""
+        if self.benchmark_daily_returns is None:
+            return {}
+
+        b1 = self.daily_bucket_returns["B1"]
+        bm = self.benchmark_daily_returns.reindex(b1.index)
+        excess = (b1 - bm).dropna()
+        if len(excess) == 0:
+            return {}
+
+        af = self.config.periods_per_year
+        ann_excess = (1 + excess.mean()) ** af - 1
+        te = excess.std() * np.sqrt(af)
+        ir = ann_excess / te if te > 0 else np.nan
+
+        return {
+            "Excess Return": ann_excess,
+            "Tracking Error": te,
+            "Information Ratio": ir,
+            "Hit Rate vs BM": (excess > 0).mean(),
+        }
+
+    def monotonicity_score(self):
+        means = self.daily_bucket_returns.mean()
         n = len(means)
         if n < 2:
             return np.nan
         return sum(means.iloc[i] > means.iloc[i + 1] for i in range(n - 1)) / (n - 1)
 
-    def rank_ic(self) -> pd.Series:
+    def rank_ic(self):
+        if "fwd_return" not in self.bucket_assignments.columns:
+            return pd.Series(dtype=float, name="IC")
+
         flip = -1.0 if not self.config.higher_is_better else 1.0
         ics = []
         for dt, grp in self.bucket_assignments.groupby("date"):
             if len(grp) < 4:
                 continue
-            ic = (grp["factor_value"] * flip).corr(grp["fwd_return"], method="spearman")
+            ic = (grp["factor_value"] * flip).corr(
+                grp["fwd_return"], method="spearman")
             ics.append({"date": dt, "IC": ic})
+
         if not ics:
             return pd.Series(dtype=float, name="IC")
         return pd.DataFrame(ics).set_index("date")["IC"]
 
-    def turnover(self) -> pd.Series:
+    def turnover(self):
         ba = self.bucket_assignments.sort_values(["country", "date"]).copy()
         ba["prev_bucket"] = ba.groupby("country")["bucket"].shift(1)
         ba = ba.dropna(subset=["prev_bucket"])
@@ -156,82 +365,108 @@ class BacktestResult:
         print(f"  FACTOR: {self.config.factor_name}")
         print(f"  Buckets: {self.config.n_buckets}  |  "
               f"Higher is better: {self.config.higher_is_better}  |  "
-              f"Periods: {len(self.bucket_returns)}  |  "
+              f"Days: {len(self.daily_bucket_returns)}  |  "
               f"Min countries: {self.config.min_countries}")
         if self.skipped_dates:
-            print(f"  Skipped (insufficient data): {len(self.skipped_dates)}")
-        print("=" * 72)
-        print()
+            print(f"  Skipped factor dates: {len(self.skipped_dates)}")
+        print("=" * 72 + "\n")
 
         fmt = tbl.copy()
-        for c in ["Ann. Return", "Ann. Vol", "Max DD"]:
-            fmt[c] = fmt[c].map(lambda x: f"{x:+.2%}")
-        fmt["Hit Rate"] = fmt["Hit Rate"].map(lambda x: f"{x:.1%}")
-        fmt["Sharpe"] = fmt["Sharpe"].map(lambda x: f"{x:.2f}")
-        fmt["Periods"] = fmt["Periods"].astype(int)
+        for c in ["Ann Return", "Ann Vol", "Max DD", "Total Return"]:
+            if c in fmt.columns:
+                fmt[c] = fmt[c].map(lambda x: f"{x:+.2%}")
+        if "Hit Rate" in fmt.columns:
+            fmt["Hit Rate"] = fmt["Hit Rate"].map(lambda x: f"{x:.1%}")
+        if "Sharpe" in fmt.columns:
+            fmt["Sharpe"] = fmt["Sharpe"].map(lambda x: f"{x:.2f}")
+        if "Days" in fmt.columns:
+            fmt["Days"] = fmt["Days"].astype(int)
         print(fmt.to_string())
         print()
 
+        ex = self.b1_excess_stats()
+        if ex:
+            print(f"  B1 vs {BENCHMARK_NAME}:")
+            print(f"    Excess Return:     {ex['Excess Return']:+.2%}")
+            print(f"    Tracking Error:    {ex['Tracking Error']:.2%}")
+            print(f"    Information Ratio: {ex['Information Ratio']:.2f}")
+            print(f"    Hit Rate vs BM:    {ex['Hit Rate vs BM']:.1%}")
+
         mono = self.monotonicity_score()
-        print(f"  Monotonicity: {mono:.0%}")
+        print(f"  Monotonicity:      {mono:.0%}")
         ic = self.rank_ic()
         if len(ic) > 0:
             t = ic.mean() / ic.std() * np.sqrt(len(ic))
-            print(f"  Mean Rank IC: {ic.mean():.3f}  (t = {t:.2f})")
-            print(f"  IC Hit Rate:  {(ic > 0).mean():.1%}")
-        print(f"  Turnover:     {self.turnover().mean():.1%}\n")
+            print(f"  Mean Rank IC:      {ic.mean():.3f}  (t = {t:.2f})")
+        to = self.turnover()
+        if len(to) > 0:
+            print(f"  Turnover:          {to.mean():.1%}")
+        print()
 
-    # ---- Presentation-quality plots --------------------------------------
+    # ---- Plots ----
 
     def plot_all(self, figsize=(16, 13)):
         fig, axes = plt.subplots(2, 2, figsize=figsize)
-        fig.suptitle(
-            self.config.factor_name,
-            fontsize=18, fontweight="bold", y=0.995,
-            color=PALETTE["darkblue"],
-        )
+        fig.suptitle(self.config.factor_name, fontsize=18, fontweight="bold",
+                     color=PALETTE["darkblue"], y=0.995)
 
+        n_days = len(self.daily_bucket_returns)
+        years = n_days / 252
         subtitle = (f"{self.config.n_buckets} quintile buckets  ·  "
-                     f"{len(self.bucket_returns)} months  ·  "
-                     f"Min {self.config.min_countries} countries")
+                    f"~{years:.1f} years of daily data  ·  "
+                    f"Min {self.config.min_countries} countries  ·  "
+                    f"Long-only top bucket vs {BENCHMARK_NAME}")
         fig.text(0.5, 0.965, subtitle, ha="center", fontsize=11,
                  color=PALETTE["grey"])
 
-        self._plot_cumulative(axes[0, 0])
+        self._plot_cumulative_with_benchmark(axes[0, 0])
         self._plot_bar(axes[0, 1])
-        self._plot_long_short(axes[1, 0])
-        self._plot_ic(axes[1, 1])
+        self._plot_b1_vs_benchmark(axes[1, 0])
+        self._plot_drawdowns(axes[1, 1])
 
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.tight_layout(rect=[0, 0, 1, 0.94])
         return fig
 
-    def _get_color(self, i, n):
+    def _bucket_color(self, i, n):
         if n <= len(BUCKET_COLORS):
             return BUCKET_COLORS[i]
-        cmap = plt.cm.RdYlGn_r
-        return cmap(i / max(n - 1, 1))
+        return plt.cm.RdYlGn_r(i / max(n - 1, 1))
 
-    def _plot_cumulative(self, ax):
+    def _plot_cumulative_with_benchmark(self, ax):
         n = self.config.n_buckets
-        for i, col in enumerate(self.cumulative.columns):
-            ax.plot(self.cumulative.index, self.cumulative[col],
-                    label=col, linewidth=2.0, color=self._get_color(i, n))
+        for i, col in enumerate(self.bucket_equity.columns):
+            ax.plot(self.bucket_equity.index, self.bucket_equity[col],
+                    label=col, linewidth=2.0, color=self._bucket_color(i, n))
+        if self.benchmark_equity is not None:
+            ax.plot(self.benchmark_equity.index, self.benchmark_equity,
+                    label=BENCHMARK_NAME, linewidth=2.0,
+                    color=PALETTE["benchmark"], linestyle="--", alpha=0.85)
         ax.set_title("Cumulative Returns by Bucket")
         ax.set_ylabel("Growth of €1")
         ax.legend(loc="upper left", frameon=True)
 
     def _plot_bar(self, ax):
-        tbl = self.summary_table().iloc[:self.config.n_buckets]
-        n = len(tbl)
-        colors = [self._get_color(i, n) for i in range(n)]
-        bars = ax.bar(tbl.index.astype(str), tbl["Ann. Return"],
+        tbl = self.summary_table()
+        bucket_rows = tbl[tbl.index.str.startswith("B")]
+        n = len(bucket_rows)
+        colors = [self._bucket_color(i, n) for i in range(n)]
+        bars = ax.bar(bucket_rows.index.astype(str), bucket_rows["Ann Return"],
                       color=colors, edgecolor="white", linewidth=1.5,
                       width=0.65, zorder=3)
-        ax.set_title("Annualised Return by Bucket")
-        ax.set_ylabel("Ann. Return")
+
+        if BENCHMARK_NAME in tbl.index:
+            bm_ret = tbl.loc[BENCHMARK_NAME, "Ann Return"]
+            ax.axhline(bm_ret, color=PALETTE["benchmark"], linewidth=1.8,
+                       linestyle="--", label=f"{BENCHMARK_NAME} ({bm_ret:+.1%})",
+                       zorder=4)
+            ax.legend(loc="upper right", fontsize=9, frameon=True)
+
         ax.axhline(0, color="black", linewidth=0.8, zorder=2)
         ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0))
-        for bar, val in zip(bars, tbl["Ann. Return"]):
+        ax.set_title("Annualised Return by Bucket")
+        ax.set_ylabel("Ann. Return")
+
+        for bar, val in zip(bars, bucket_rows["Ann Return"]):
             offset = 0.003 if val >= 0 else -0.003
             ax.text(bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + offset,
@@ -239,169 +474,187 @@ class BacktestResult:
                     va="bottom" if val >= 0 else "top",
                     fontsize=10, fontweight="bold")
 
-    def _plot_long_short(self, ax):
-        ax.plot(self.cum_long_short.index, self.cum_long_short.values,
-                color=PALETTE["blue"], linewidth=2.0)
-        ax.fill_between(self.cum_long_short.index, 1,
-                        self.cum_long_short.values,
-                        where=self.cum_long_short.values >= 1,
-                        alpha=0.15, color=PALETTE["green"])
-        ax.fill_between(self.cum_long_short.index, 1,
-                        self.cum_long_short.values,
-                        where=self.cum_long_short.values < 1,
-                        alpha=0.15, color=PALETTE["red"])
-        ax.axhline(1.0, color="black", linewidth=0.8, linestyle="--")
-        ax.set_title(f"Cumulative Long / Short  ({self.long_short.name})")
-        ax.set_ylabel("Growth of €1")
+    def _plot_b1_vs_benchmark(self, ax):
+        b1 = self.bucket_equity["B1"]
+        ax.plot(b1.index, b1.values, label="B1 (Top Bucket)",
+                color=PALETTE["green"], linewidth=2.5)
 
-    def _plot_ic(self, ax):
-        ic = self.rank_ic()
-        if len(ic) == 0:
-            ax.text(0.5, 0.5, "No IC data", transform=ax.transAxes, ha="center")
-            return
-        colors = [PALETTE["green"] if v > 0 else PALETTE["red"] for v in ic.values]
-        ax.bar(ic.index, ic.values, color=colors, alpha=0.5, width=25)
-        ax.axhline(ic.mean(), color=PALETTE["darkblue"], linewidth=2,
-                    label=f"Mean IC = {ic.mean():.3f}")
-        ax.axhline(0, color="black", linewidth=0.8)
-        ax.set_title("Rank IC  (Spearman)")
-        ax.set_ylabel("IC")
-        ax.legend(frameon=True)
+        if self.benchmark_equity is not None:
+            ax.plot(self.benchmark_equity.index, self.benchmark_equity,
+                    label=BENCHMARK_NAME, color=PALETTE["benchmark"],
+                    linewidth=2.0, linestyle="--", alpha=0.85)
+
+            common_idx = b1.index.intersection(self.benchmark_equity.index)
+            if len(common_idx) > 0:
+                b1c = b1.reindex(common_idx)
+                bmc = self.benchmark_equity.reindex(common_idx)
+                ax.fill_between(common_idx, b1c, bmc,
+                                where=(b1c >= bmc), alpha=0.18,
+                                color=PALETTE["green"], interpolate=True)
+                ax.fill_between(common_idx, b1c, bmc,
+                                where=(b1c < bmc), alpha=0.18,
+                                color=PALETTE["red"], interpolate=True)
+
+        ax.set_title(f"B1 (Top Bucket) vs {BENCHMARK_NAME}")
+        ax.set_ylabel("Growth of €1")
+        ax.legend(loc="upper left", frameon=True)
+
+    def _plot_drawdowns(self, ax):
+        b1 = self.bucket_equity["B1"]
+        dd_b1 = b1 / b1.cummax() - 1
+        ax.fill_between(dd_b1.index, dd_b1, 0, alpha=0.4,
+                        color=PALETTE["green"], label="B1")
+        if self.benchmark_equity is not None:
+            dd_bm = self.benchmark_equity / self.benchmark_equity.cummax() - 1
+            ax.plot(dd_bm.index, dd_bm, color=PALETTE["benchmark"],
+                    linewidth=1.8, linestyle="--", alpha=0.85,
+                    label=BENCHMARK_NAME)
+        ax.set_title("Drawdowns")
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0))
+        ax.legend(loc="lower left", frameon=True)
 
 
 # =========================================================================
-# Main engine
+# Engine
 # =========================================================================
 
 class FactorBacktest:
-    def __init__(self, config: Optional[BacktestConfig] = None):
+    def __init__(self, config=None):
         self.config = config or BacktestConfig()
 
-    @staticmethod
-    def _load_csv(path, required_cols, date_col="date"):
-        if isinstance(path, pd.DataFrame):
-            df = path.copy()
-        else:
-            df = pd.read_csv(path)
-        df.columns = df.columns.str.strip().str.lower()
-        missing = [c for c in required_cols if c not in df.columns]
-        if missing:
-            raise ValueError(f"Missing columns: {missing}. Have: {list(df.columns)}")
-        df[date_col] = pd.to_datetime(df[date_col])
-        return df
-
-    def run(self, factor_csv, returns_csv,
-            date_col="date", country_col="country",
-            factor_col="factor_value", return_col="return") -> BacktestResult:
+    def run(self, factor_csv, daily_country_prices, benchmark_daily_prices=None):
         """
-        Execute the quintile-sort backtest.
+        Run quintile-sort backtest using monthly factor signals and daily prices.
 
-        For each factor date t:
-          1. Get factor values for all countries at t.
-          2. Find the next return date t+1 (strictly after t).
-          3. Get country returns at t+1.
-          4. Inner-join: only countries with both factor[t] and return[t+1].
-          5. If ≥ min_countries: rank, assign buckets, record bucket returns.
-          6. Otherwise: skip this period.
+        Parameters
+        ----------
+        factor_csv : str, Path, or DataFrame
+            Monthly factor data with columns: date, country, factor_value
+        daily_country_prices : DataFrame
+            Daily country prices indexed by date, columns = country names
+        benchmark_daily_prices : Series or None
+            Daily benchmark prices
+
+        Returns
+        -------
+        BacktestResult
         """
         cfg = self.config
 
-        factor_df = self._load_csv(factor_csv, [date_col, country_col, factor_col], date_col)
-        returns_df = self._load_csv(returns_csv, [date_col, country_col, return_col], date_col)
+        # Load factor
+        if isinstance(factor_csv, pd.DataFrame):
+            factor_df = factor_csv.copy()
+        else:
+            factor_df = pd.read_csv(factor_csv, parse_dates=["date"])
+        factor_df.columns = factor_df.columns.str.strip().str.lower()
+        factor_df["date"] = pd.to_datetime(factor_df["date"])
+        factor_df = factor_df.dropna(subset=["factor_value"])
 
-        factor_df = factor_df.rename(columns={
-            factor_col: "factor_value", country_col: "country", date_col: "date"})
-        returns_df = returns_df.rename(columns={
-            return_col: "return", country_col: "country", date_col: "date"})
+        # Daily returns
+        daily_returns = daily_country_prices.pct_change()
+        bm_daily_returns = (benchmark_daily_prices.pct_change()
+                            if benchmark_daily_prices is not None else None)
 
         factor_dates = sorted(factor_df["date"].unique())
-        return_dates_arr = np.array(sorted(returns_df["date"].unique()))
 
-        bucket_return_rows = []
+        bucket_holdings = {b: [] for b in range(1, cfg.n_buckets + 1)}
         assignment_rows = []
         skipped = []
 
-        for fdate in factor_dates:
-            # Step 1-2: find next return date strictly after factor date
-            candidates = return_dates_arr[return_dates_arr > fdate]
-            if len(candidates) == 0:
-                continue
-            fwd_date = candidates[0]
-
-            # Step 3-4: merge factor[t] with return[t+1] on country
-            fslice = factor_df.loc[
-                factor_df["date"] == fdate, ["country", "factor_value"]
+        for i, fdate in enumerate(factor_dates):
+            # Step 1: factor values at this date
+            fslice = factor_df[factor_df["date"] == fdate][
+                ["country", "factor_value"]
             ].dropna(subset=["factor_value"])
-            rslice = returns_df.loc[
-                returns_df["date"] == fwd_date, ["country", "return"]
-            ].dropna(subset=["return"])
-            merged = fslice.merge(rslice, on="country", how="inner")
 
-            # Step 5: check minimum coverage
-            if len(merged) < cfg.min_countries:
+            # Only countries with daily price coverage
+            valid_cols = set(daily_returns.columns)
+            fslice = fslice[fslice["country"].isin(valid_cols)]
+
+            if len(fslice) < cfg.min_countries:
                 skipped.append(fdate)
                 continue
 
-            # Rank: sort so B1 = most attractive
-            merged = merged.sort_values(
+            # Step 2: holding period = next trading day after fdate
+            #         until next trading day after the next factor date
+            next_days = daily_returns.index[daily_returns.index > fdate]
+            if len(next_days) == 0:
+                continue
+            start_date = next_days[0]
+
+            if i + 1 < len(factor_dates):
+                next_fdate = factor_dates[i + 1]
+                next_next = daily_returns.index[daily_returns.index > next_fdate]
+                end_date = next_next[0] if len(next_next) > 0 else None
+            else:
+                end_date = None
+
+            # Step 3: rank and assign buckets
+            fslice = fslice.sort_values(
                 "factor_value", ascending=not cfg.higher_is_better
             ).reset_index(drop=True)
 
-            n = len(merged)
+            n = len(fslice)
             bucket_size = n / cfg.n_buckets
-            merged["bucket"] = [
+            fslice["bucket"] = [
                 min(int(j // bucket_size) + 1, cfg.n_buckets) for j in range(n)
             ]
 
-            # Record bucket-level equal-weighted returns
-            bkt_rets = merged.groupby("bucket")["return"].mean()
-            row = {"date": fwd_date}
-            for b in range(1, cfg.n_buckets + 1):
-                row[f"B{b}"] = bkt_rets.get(b, np.nan)
-            bucket_return_rows.append(row)
+            # Add to each bucket's holdings history
+            for bucket in range(1, cfg.n_buckets + 1):
+                bucket_countries = set(fslice[fslice["bucket"] == bucket]["country"])
+                bucket_holdings[bucket].append((start_date, end_date, bucket_countries))
 
-            for _, r in merged.iterrows():
+            # Step 4: per-country forward returns over the holding period (for IC)
+            if end_date is not None:
+                period_mask = ((daily_returns.index >= start_date)
+                               & (daily_returns.index < end_date))
+            else:
+                period_mask = daily_returns.index >= start_date
+
+            period_data = daily_returns.loc[period_mask]
+            if len(period_data) > 0:
+                period_total = (1 + period_data.fillna(0)).prod() - 1
+            else:
+                period_total = pd.Series(dtype=float)
+
+            for _, row in fslice.iterrows():
                 assignment_rows.append({
-                    "date": fwd_date, "country": r["country"],
-                    "bucket": int(r["bucket"]),
-                    "factor_value": r["factor_value"],
-                    "fwd_return": r["return"],
+                    "date": fdate,
+                    "country": row["country"],
+                    "bucket": int(row["bucket"]),
+                    "factor_value": row["factor_value"],
+                    "fwd_return": period_total.get(row["country"], np.nan),
                 })
 
-        if not bucket_return_rows:
+        if not assignment_rows:
             raise RuntimeError(
-                "No valid periods. Check date alignment and data coverage.")
+                "No valid periods produced. Check factor data coverage."
+            )
 
-        bucket_returns = pd.DataFrame(bucket_return_rows).set_index("date").sort_index()
+        # Step 5: build daily bucket return series
+        bucket_daily = {}
+        for bucket, history in bucket_holdings.items():
+            port = portfolio_daily_returns(daily_returns, history)
+            bucket_daily[f"B{bucket}"] = port
+
+        daily_bucket_returns = pd.DataFrame(bucket_daily).sort_index()
         bucket_assignments = pd.DataFrame(assignment_rows)
 
-        return BacktestResult(bucket_returns, bucket_assignments, cfg, skipped)
-
-    def run_combined(self, csv_path, date_col="date", country_col="country",
-                     factor_col="factor_value", return_col="return"):
-        df = self._load_csv(csv_path, [date_col, country_col, factor_col, return_col], date_col)
-        return self.run(
-            df[[date_col, country_col, factor_col]],
-            df[[date_col, country_col, return_col]],
-            date_col=date_col, country_col=country_col,
-            factor_col=factor_col, return_col=return_col)
+        return BacktestResult(
+            bucket_assignments=bucket_assignments,
+            daily_bucket_returns=daily_bucket_returns,
+            benchmark_daily_returns=bm_daily_returns,
+            config=cfg,
+            skipped_dates=skipped,
+        )
 
 
 # =========================================================================
-# Eligibility check (used by run_all_backtests.py)
+# Eligibility check
 # =========================================================================
 
-def check_factor_eligibility(factor_path: Union[str, Path],
-                             min_countries: int = 10,
-                             min_eligible_periods: int = 36) -> dict:
-    """
-    Pre-screen a factor file for data quality.
-
-    Returns dict with:
-      eligible: bool
-      reason: str (why not eligible, if applicable)
-      n_dates, median_countries, min_countries_in_data, etc.
-    """
+def check_factor_eligibility(factor_path, min_countries=10, min_eligible_periods=36):
     df = pd.read_csv(factor_path, parse_dates=["date"])
     df = df.dropna(subset=["factor_value"])
 
@@ -411,12 +664,10 @@ def check_factor_eligibility(factor_path: Union[str, Path],
     info = {
         "n_dates": len(counts),
         "eligible_dates": int(eligible_dates),
-        "median_countries": float(counts.median()),
-        "min_countries_in_data": int(counts.min()),
-        "max_countries_in_data": int(counts.max()),
-        "unique_countries": sorted(df["country"].unique().tolist()),
+        "median_countries": float(counts.median()) if len(counts) > 0 else 0,
+        "min_countries_in_data": int(counts.min()) if len(counts) > 0 else 0,
+        "max_countries_in_data": int(counts.max()) if len(counts) > 0 else 0,
         "n_unique_countries": df["country"].nunique(),
-        "date_range": f"{df['date'].min().date()} to {df['date'].max().date()}",
     }
 
     if info["max_countries_in_data"] < min_countries:

@@ -1,13 +1,13 @@
 """
-strategy_backtest.py — Long-only top-bucket strategy backtester (v2)
-=====================================================================
+strategy_backtest.py — Long-only top-bucket strategies with daily equity curves
+================================================================================
 
-For each factor: rank countries, buy B1 equal-weighted, track turnover,
-apply transaction costs (€81/trade on €60k portfolio), benchmark vs MSCI EM.
-Tests monthly and quarterly rebalancing.
-
-Usage:
-    python strategy_backtest.py
+For each selected factor:
+  - Each rebalancing date (monthly or quarterly): rank, pick B1
+  - Hold equal-weighted between rebalancing dates
+  - Apply transaction costs as one-day drag on rebalancing days
+  - Compare to MSCI EM benchmark
+  - All equity curves computed from DAILY price data
 """
 
 import matplotlib
@@ -20,92 +20,42 @@ import matplotlib.ticker as mticker
 from pathlib import Path
 from collections import Counter
 from dataclasses import dataclass
-from typing import Optional, List, Set
-from factor_backtest import apply_chart_style, PALETTE, BUCKET_COLORS
+from typing import List, Set, Optional
+
+from factor_backtest import (
+    load_daily_prices, portfolio_daily_returns, annualised_stats,
+    align_to_common_start, apply_chart_style, PALETTE, BENCHMARK_NAME,
+)
 
 apply_chart_style()
 
-# =========================================================================
-# Configuration
-# =========================================================================
 
-DATA_DIR   = Path("backtest_data")
-OUTPUT_DIR = Path("strategy_results")
+# Configuration
+DATA_DIR    = Path("backtest_data")
+OUTPUT_DIR  = Path("strategy_results")
+PRICE_FILE  = "EM_Indices_EUR.csv"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-PORTFOLIO_VALUE  = 60_000.0
-COST_PER_TRADE   = 81.0
-N_BUCKETS        = 5
-MIN_COUNTRIES    = 10
-
-PRICE_FILE = "EM_Indices_EUR.csv"
+PORTFOLIO_VALUE = 60_000.0
+COST_PER_TRADE  = 81.0
+N_BUCKETS       = 5
+MIN_COUNTRIES   = 10
 
 STRATEGIES = [
-    ("trailing_pe",          "Trailing PE",                False),
-    ("forward_pe",           "Forward PE",                 False),
-    ("price_to_fcf",         "Price-to-Free-Cash-Flow",    False),
-    ("price_to_cf",          "Price-to-Cash-Flow",         False),
-    ("forward_roe",          "Forward ROE",                True),
-    ("trailing_roa",         "Trailing ROA",               True),
-    ("cpi_3m_change",        "CPI 3M Change",              False),
-    ("sales_revision_3m",    "Sales Revision (3M)",        True),
+    ("trailing_pe",       "Trailing PE",             False),
+    ("forward_pe",        "Forward PE",              False),
+    ("price_to_fcf",      "Price-to-Free-Cash-Flow", False),
+    ("price_to_cf",       "Price-to-Cash-Flow",      False),
+    ("forward_roe",       "Forward ROE",             True),
+    ("trailing_roa",      "Trailing ROA",            True),
+    ("cpi_3m_change",     "CPI 3M Change",           False),
+    ("sales_revision_3m", "Sales Revision (3M)",     True),
 ]
 
 
 # =========================================================================
-# Data loading
+# Strategy result
 # =========================================================================
-
-def load_returns(data_dir):
-    df = pd.read_csv(data_dir / "returns.csv", parse_dates=["date"])
-    return df.sort_values(["date", "country"]).reset_index(drop=True)
-
-def load_factor(data_dir, factor_id):
-    df = pd.read_csv(data_dir / f"factor_{factor_id}.csv", parse_dates=["date"])
-    return df.sort_values(["date", "country"]).reset_index(drop=True)
-
-def load_benchmark(price_file):
-    prices = pd.read_csv(price_file)
-    prices.columns = [c.strip() for c in prices.columns]
-    prices.rename(columns={prices.columns[0]: "date"}, inplace=True)
-    prices["date"] = pd.to_datetime(prices["date"])
-
-    em_col = None
-    for c in ["MIMUEMRN Index", "MIMUEMRN.Index"]:
-        if c in prices.columns:
-            em_col = c
-            break
-    if em_col is None:
-        print("WARNING: MSCI EM benchmark not found.")
-        return pd.Series(dtype=float)
-
-    em = prices[["date", em_col]].dropna().copy()
-    em.columns = ["date", "price"]
-    em = em.sort_values("date")
-    em["ym"] = em["date"].dt.to_period("M")
-    em = em.groupby("ym").last().reset_index()
-    em["return"] = em["price"] / em["price"].shift(1) - 1
-    em = em.dropna(subset=["return"])
-    em.index = em["date"]
-    return em["return"].rename("MSCI_EM")
-
-
-# =========================================================================
-# Strategy engine
-# =========================================================================
-
-@dataclass
-class PeriodDetail:
-    date: pd.Timestamp
-    holdings: set
-    n_countries_available: int
-    n_trades: int
-    cost_pct: float
-    gross_return: float
-    net_return: float
-    benchmark_return: float
-    rebalanced: bool
-
 
 @dataclass
 class StrategyResult:
@@ -113,136 +63,151 @@ class StrategyResult:
     factor_label: str
     rebal_freq: str
     higher_is_better: bool
-    periods: List[PeriodDetail]
+    daily_returns_gross: pd.Series
+    daily_returns_net: pd.Series
+    holdings_history: list
+    n_trades_per_rebal: dict
+    benchmark_daily_returns: Optional[pd.Series]
 
-    def to_dataframe(self):
-        rows = [{
-            "date": p.date, "gross_return": p.gross_return,
-            "net_return": p.net_return, "benchmark": p.benchmark_return,
-            "n_trades": p.n_trades, "cost_pct": p.cost_pct,
-            "n_countries": p.n_countries_available,
-            "rebalanced": p.rebalanced,
-            "holdings": "|".join(sorted(p.holdings)),
-        } for p in self.periods]
-        return pd.DataFrame(rows).set_index("date")
+    @property
+    def equity_gross(self):
+        return (1 + self.daily_returns_gross.fillna(0)).cumprod()
+
+    @property
+    def equity_net(self):
+        return (1 + self.daily_returns_net.fillna(0)).cumprod()
+
+    @property
+    def equity_benchmark(self):
+        if self.benchmark_daily_returns is None:
+            return None
+        bm = self.benchmark_daily_returns.reindex(self.daily_returns_gross.index)
+        return (1 + bm.fillna(0)).cumprod()
 
     def summary(self):
-        df = self.to_dataframe()
-        af = 12
-        def _s(series, lbl):
-            s = series.dropna()
-            if len(s) == 0: return {}
-            ann_ret = (1 + s.mean()) ** af - 1
-            ann_vol = s.std() * np.sqrt(af)
-            sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
-            cum = (1 + s).cumprod()
-            max_dd = (cum / cum.cummax() - 1).min()
-            return {f"{lbl} Ann Ret": ann_ret, f"{lbl} Vol": ann_vol,
-                    f"{lbl} Sharpe": sharpe, f"{lbl} Max DD": max_dd,
-                    f"{lbl} Hit Rate": (s > 0).mean(),
-                    f"{lbl} Total Ret": cum.iloc[-1] - 1}
+        af = 252
+        net = annualised_stats(self.daily_returns_net, af)
+        gross = annualised_stats(self.daily_returns_gross, af)
 
-        stats = {"Factor": self.factor_label, "Rebal": self.rebal_freq,
-                 "Months": len(df)}
-        stats.update(_s(df["net_return"], "Net"))
-        stats.update(_s(df["gross_return"], "Gross"))
-        stats.update(_s(df["benchmark"].dropna(), "BM"))
+        bm_stats = {}
+        excess_data = {}
+        if self.benchmark_daily_returns is not None:
+            bm_aligned = self.benchmark_daily_returns.reindex(
+                self.daily_returns_net.index)
+            bm_stats = annualised_stats(bm_aligned, af)
 
-        excess = (df["net_return"] - df["benchmark"]).dropna()
-        if len(excess) > 0:
-            stats["Excess Ann Ret"] = (1 + excess.mean()) ** af - 1
-            te = excess.std() * np.sqrt(af)
-            stats["Tracking Error"] = te
-            stats["Info Ratio"] = stats["Excess Ann Ret"] / te if te > 0 else np.nan
+            excess = (self.daily_returns_net - bm_aligned).dropna()
+            if len(excess) > 0:
+                ann_ex = (1 + excess.mean()) ** af - 1
+                te = excess.std() * np.sqrt(af)
+                excess_data = {
+                    "Excess Ann Ret": ann_ex,
+                    "Tracking Error": te,
+                    "Information Ratio": ann_ex / te if te > 0 else np.nan,
+                }
 
-        stats["Total Trades"] = int(df["n_trades"].sum())
-        stats["Total Cost EUR"] = stats["Total Trades"] * COST_PER_TRADE
-        stats["Ann Cost Drag"] = df["cost_pct"].mean() * af
-        return stats
+        total_trades = sum(self.n_trades_per_rebal.values())
+        total_cost_eur = total_trades * COST_PER_TRADE
+        years = len(self.daily_returns_net) / af
+
+        return {
+            "Factor": self.factor_label,
+            "Rebal": self.rebal_freq,
+            "Days": len(self.daily_returns_net),
+            "Net Ann Ret": net.get("Ann Return", np.nan),
+            "Net Ann Vol": net.get("Ann Vol", np.nan),
+            "Net Sharpe": net.get("Sharpe", np.nan),
+            "Net Max DD": net.get("Max DD", np.nan),
+            "Gross Ann Ret": gross.get("Ann Return", np.nan),
+            "Gross Sharpe": gross.get("Sharpe", np.nan),
+            "BM Ann Ret": bm_stats.get("Ann Return", np.nan),
+            **excess_data,
+            "Total Trades": total_trades,
+            "Total Cost EUR": total_cost_eur,
+            "Cost Drag/yr": (total_cost_eur / PORTFOLIO_VALUE / years
+                             if years > 0 else 0),
+        }
 
     def holding_frequency(self):
         freq = Counter()
-        for p in self.periods:
-            for c in p.holdings:
+        n_periods = len(self.holdings_history)
+        for _, _, holdings in self.holdings_history:
+            for c in holdings:
                 freq[c] += 1
-        return freq
+        return freq, n_periods
 
 
 def run_strategy(factor_id, factor_label, higher_is_better,
-                 returns_df, factor_df, benchmark, rebal_freq="monthly"):
+                 factor_df, daily_country_prices, benchmark_daily_returns,
+                 rebal_freq="monthly"):
     """
-    Each rebalancing date:
-      1. Observe factor at date t
-      2. Find return date t+1 (strictly after t)
-      3. If ≥ MIN_COUNTRIES countries have both factor[t] and return[t+1]:
-         rank, pick B1, compute trades vs previous holdings
-      4. Otherwise: hold existing portfolio (no trades)
-      5. Record the return over month t+1 for whatever we hold
+    Build a long-only top-bucket strategy with daily equity curve.
+
+    Steps:
+      1. Filter factor dates to rebalancing schedule
+         (monthly = all factor dates, quarterly = every 3rd)
+      2. At each rebalancing factor date t:
+         - Rank countries, identify B1 (top quintile)
+         - Hold from next trading day after t until next rebalancing date
+      3. Compute daily portfolio returns from daily prices
+      4. Apply transaction costs as one-day drag on rebalancing days
     """
+    daily_returns = daily_country_prices.pct_change()
     factor_dates = sorted(factor_df["date"].unique())
-    return_dates_arr = np.array(sorted(returns_df["date"].unique()))
 
-    pairs = []
-    for fdate in factor_dates:
-        candidates = return_dates_arr[return_dates_arr > fdate]
-        if len(candidates) == 0:
-            continue
-        pairs.append((fdate, candidates[0]))
+    if rebal_freq == "monthly":
+        rebal_dates = factor_dates
+    elif rebal_freq == "quarterly":
+        rebal_dates = factor_dates[::3]
+    else:
+        raise ValueError(f"Unknown freq: {rebal_freq}")
 
-    if not pairs:
-        raise RuntimeError(f"No valid date pairs for {factor_label}")
+    holdings_history = []
+    n_trades_per_rebal = {}
+    current_holdings = set()
 
-    current_holdings: Set[str] = set()
-    period_details: List[PeriodDetail] = []
-    rebal_counter = 0
-
-    for i, (fdate, ret_date) in enumerate(pairs):
-        # Rebalance decision
-        do_rebalance = (rebal_freq == "monthly")
-        if rebal_freq == "quarterly":
-            if i == 0 or rebal_counter >= 2:
-                do_rebalance = True
-                rebal_counter = 0
-            else:
-                rebal_counter += 1
-
-        # Get data
+    for i, fdate in enumerate(rebal_dates):
+        # Get factor values
         fslice = factor_df[factor_df["date"] == fdate][
-            ["country", "factor_value"]].dropna(subset=["factor_value"])
-        rslice = returns_df[returns_df["date"] == ret_date][
-            ["country", "return"]].dropna(subset=["return"])
-        merged = fslice.merge(rslice, on="country", how="inner")
-        n_available = len(merged)
+            ["country", "factor_value"]
+        ].dropna(subset=["factor_value"])
 
-        # Benchmark
-        bm_ret = np.nan
-        if benchmark is not None and len(benchmark) > 0:
-            bm_match = benchmark.reindex([ret_date])
-            if len(bm_match) > 0 and not bm_match.isna().all():
-                bm_ret = bm_match.iloc[0]
+        # Filter to countries with daily price coverage
+        valid_cols = set(daily_country_prices.columns)
+        fslice = fslice[fslice["country"].isin(valid_cols)]
 
-        # Attempt rebalancing
-        if do_rebalance and n_available >= MIN_COUNTRIES:
-            merged = merged.sort_values(
-                "factor_value", ascending=not higher_is_better
-            ).reset_index(drop=True)
-            n = len(merged)
-            bucket_size = n / N_BUCKETS
-            merged["bucket"] = [
-                min(int(j // bucket_size) + 1, N_BUCKETS) for j in range(n)]
-            new_holdings = set(merged[merged["bucket"] == 1]["country"])
-            rebalanced = True
-        else:
-            new_holdings = current_holdings.copy()
-            rebalanced = False
-
-        # Need holdings to proceed
-        if not new_holdings and not current_holdings:
+        if len(fslice) < MIN_COUNTRIES:
             continue
-        if not new_holdings:
-            new_holdings = current_holdings.copy()
 
-        # Trades
+        # Holding period: next trading day after fdate
+        # until next trading day after the next rebalancing date
+        next_days = daily_returns.index[daily_returns.index > fdate]
+        if len(next_days) == 0:
+            continue
+        start_date = next_days[0]
+
+        if i + 1 < len(rebal_dates):
+            next_fdate = rebal_dates[i + 1]
+            next_next = daily_returns.index[daily_returns.index > next_fdate]
+            end_date = next_next[0] if len(next_next) > 0 else None
+        else:
+            end_date = None
+
+        # Rank and assign buckets
+        fslice = fslice.sort_values(
+            "factor_value", ascending=not higher_is_better
+        ).reset_index(drop=True)
+        n = len(fslice)
+        bucket_size = n / N_BUCKETS
+        fslice["bucket"] = [
+            min(int(j // bucket_size) + 1, N_BUCKETS) for j in range(n)
+        ]
+        new_holdings = set(fslice[fslice["bucket"] == 1]["country"])
+
+        if not new_holdings:
+            continue
+
+        # Trades count
         if not current_holdings:
             n_trades = len(new_holdings)
         else:
@@ -250,111 +215,111 @@ def run_strategy(factor_id, factor_label, higher_is_better,
             buys = new_holdings - current_holdings
             n_trades = len(sells) + len(buys)
 
-        cost_pct = (n_trades * COST_PER_TRADE) / PORTFOLIO_VALUE
+        n_trades_per_rebal[start_date] = n_trades
+        holdings_history.append((start_date, end_date, new_holdings))
+        current_holdings = new_holdings
 
-        # Return
-        ret_data = returns_df[returns_df["date"] == ret_date]
-        held_rets = ret_data[ret_data["country"].isin(new_holdings)]["return"]
-        if len(held_rets) == 0:
-            held_rets = ret_data[ret_data["country"].isin(current_holdings)]["return"]
-            if len(held_rets) == 0:
-                continue
-            new_holdings = current_holdings.copy()
-            n_trades = 0
-            cost_pct = 0
+    if not holdings_history:
+        raise RuntimeError(f"No valid rebalances for {factor_label}")
 
-        port_ret = held_rets.mean()
+    # Daily portfolio returns
+    gross_daily = portfolio_daily_returns(daily_returns, holdings_history)
 
-        period_details.append(PeriodDetail(
-            date=ret_date, holdings=new_holdings.copy(),
-            n_countries_available=n_available, n_trades=n_trades,
-            cost_pct=cost_pct, gross_return=port_ret,
-            net_return=port_ret - cost_pct,
-            benchmark_return=bm_ret, rebalanced=rebalanced))
-
-        current_holdings = new_holdings.copy()
+    daily_costs = {
+        d: (n_trades * COST_PER_TRADE) / PORTFOLIO_VALUE
+        for d, n_trades in n_trades_per_rebal.items()
+    }
+    net_daily = portfolio_daily_returns(daily_returns, holdings_history, daily_costs)
 
     return StrategyResult(
-        factor_id=factor_id, factor_label=factor_label,
-        rebal_freq=rebal_freq, higher_is_better=higher_is_better,
-        periods=period_details)
+        factor_id=factor_id,
+        factor_label=factor_label,
+        rebal_freq=rebal_freq,
+        higher_is_better=higher_is_better,
+        daily_returns_gross=gross_daily,
+        daily_returns_net=net_daily,
+        holdings_history=holdings_history,
+        n_trades_per_rebal=n_trades_per_rebal,
+        benchmark_daily_returns=benchmark_daily_returns,
+    )
 
 
 # =========================================================================
-# Plotting
+# Plots
 # =========================================================================
 
 def plot_strategy(result, save_path):
-    df = result.to_dataframe()
     fig, axes = plt.subplots(2, 2, figsize=(16, 11))
-    fig.suptitle(f"{result.factor_label}",
-                 fontsize=18, fontweight="bold", color=PALETTE["darkblue"], y=0.995)
+    fig.suptitle(result.factor_label, fontsize=18, fontweight="bold",
+                 color=PALETTE["darkblue"], y=0.995)
     fig.text(0.5, 0.965,
              f"{result.rebal_freq.title()} rebalancing  ·  "
-             f"Min {MIN_COUNTRIES} countries  ·  "
+             f"Daily equity curve  ·  Min {MIN_COUNTRIES} countries  ·  "
              f"€{COST_PER_TRADE:.0f}/trade on €{PORTFOLIO_VALUE:,.0f}",
              ha="center", fontsize=11, color=PALETTE["grey"])
 
+    eq_gross = result.equity_gross
+    eq_net = result.equity_net
+    eq_bm = result.equity_benchmark
+
     # 1. Cumulative returns
     ax = axes[0, 0]
-    cum_g = (1 + df["gross_return"]).cumprod()
-    cum_n = (1 + df["net_return"]).cumprod()
-    ax.plot(cum_g.index, cum_g, label="Gross", color=PALETTE["blue"], linewidth=2)
-    ax.plot(cum_n.index, cum_n, label="Net of costs", color=PALETTE["darkblue"],
-            linewidth=2, linestyle="--")
-    bm = df["benchmark"].dropna()
-    if len(bm) > 0:
-        cum_bm = (1 + bm).cumprod()
-        ax.plot(cum_bm.index, cum_bm, label="MSCI EM", color=PALETTE["grey"],
-                linewidth=1.8, alpha=0.7)
+    ax.plot(eq_gross.index, eq_gross, label="Gross",
+            color=PALETTE["blue"], linewidth=2)
+    ax.plot(eq_net.index, eq_net, label="Net of costs",
+            color=PALETTE["darkblue"], linewidth=2, linestyle="--")
+    if eq_bm is not None:
+        ax.plot(eq_bm.index, eq_bm, label=BENCHMARK_NAME,
+                color=PALETTE["benchmark"], linewidth=2, alpha=0.85,
+                linestyle=":")
     ax.set_title("Cumulative Returns")
     ax.set_ylabel("Growth of €1")
     ax.legend(frameon=True)
 
-    # 2. Rolling 12M excess
+    # 2. Rolling 12M excess (computed monthly)
     ax = axes[0, 1]
-    excess = (df["net_return"] - df["benchmark"]).dropna()
-    if len(excess) > 12:
-        rolling = excess.rolling(12).mean() * 12
-        ax.plot(rolling.index, rolling, color=PALETTE["blue"], linewidth=1.8)
-        ax.fill_between(rolling.index, 0, rolling,
-                        where=rolling >= 0, alpha=0.15, color=PALETTE["green"])
-        ax.fill_between(rolling.index, 0, rolling,
-                        where=rolling < 0, alpha=0.15, color=PALETTE["red"])
-    ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
-    ax.set_title("Rolling 12M Excess Return  (Net vs MSCI EM)")
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0))
+    if eq_bm is not None:
+        net_m = result.daily_returns_net.resample("ME").apply(
+            lambda x: (1 + x).prod() - 1)
+        bm_aligned = result.benchmark_daily_returns.reindex(
+            result.daily_returns_net.index)
+        bm_m = bm_aligned.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+        excess_m = (net_m - bm_m).dropna()
+        if len(excess_m) > 12:
+            rolling = excess_m.rolling(12).sum()
+            ax.plot(rolling.index, rolling, color=PALETTE["blue"], linewidth=1.8)
+            ax.fill_between(rolling.index, 0, rolling,
+                            where=(rolling >= 0), alpha=0.18,
+                            color=PALETTE["green"])
+            ax.fill_between(rolling.index, 0, rolling,
+                            where=(rolling < 0), alpha=0.18,
+                            color=PALETTE["red"])
+        ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+        ax.set_title(f"Rolling 12M Excess Return  (Net vs {BENCHMARK_NAME})")
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0))
 
     # 3. Drawdowns
     ax = axes[1, 0]
-    cum_n2 = (1 + df["net_return"]).cumprod()
-    dd = cum_n2 / cum_n2.cummax() - 1
-    ax.fill_between(dd.index, dd, 0, alpha=0.4, color=PALETTE["blue"],
-                    label="Strategy (Net)")
-    if len(bm) > 0:
-        cum_bm2 = (1 + bm).cumprod()
-        dd_bm = cum_bm2 / cum_bm2.cummax() - 1
-        ax.plot(dd_bm.index, dd_bm, color=PALETTE["grey"], linewidth=1.2,
-                alpha=0.7, label="MSCI EM")
+    dd_net = eq_net / eq_net.cummax() - 1
+    ax.fill_between(dd_net.index, dd_net, 0, alpha=0.4,
+                    color=PALETTE["blue"], label="Strategy (Net)")
+    if eq_bm is not None:
+        dd_bm = eq_bm / eq_bm.cummax() - 1
+        ax.plot(dd_bm.index, dd_bm, color=PALETTE["benchmark"],
+                linewidth=1.8, linestyle="--", alpha=0.85, label=BENCHMARK_NAME)
     ax.set_title("Drawdowns")
     ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0))
     ax.legend(frameon=True)
 
-    # 4. Coverage & trades
+    # 4. Trades per rebalancing
     ax = axes[1, 1]
-    ax.bar(df.index, df["n_countries"], color=PALETTE["blue"], alpha=0.25,
-           width=25, label="Countries available")
-    ax.axhline(MIN_COUNTRIES, color=PALETTE["red"], linewidth=1.2,
-               linestyle="--", label=f"Min threshold ({MIN_COUNTRIES})")
-    ax2 = ax.twinx()
-    t = df["n_trades"]
-    ax2.bar(df.index[t > 0], t[t > 0], color=PALETTE["orange"],
-            alpha=0.7, width=15, label="Trades")
-    ax.set_title("Data Coverage & Trades")
-    ax.set_ylabel("Countries")
-    ax2.set_ylabel("Trades")
-    ax.legend(loc="upper left", fontsize=8, frameon=True)
-    ax2.legend(loc="upper right", fontsize=8, frameon=True)
+    if result.n_trades_per_rebal:
+        dates = sorted(result.n_trades_per_rebal.keys())
+        trades = [result.n_trades_per_rebal[d] for d in dates]
+        ax.bar(dates, trades, color=PALETTE["orange"], alpha=0.75, width=15)
+        ax.set_title("Trades per Rebalancing")
+        ax.set_ylabel("# Trades")
+        ax.set_ylim(0, max(trades) + 1 if trades else 1)
 
     plt.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(str(save_path), dpi=200, bbox_inches="tight")
@@ -362,39 +327,50 @@ def plot_strategy(result, save_path):
 
 
 def plot_comparison(all_results, save_path):
+    """Side-by-side: monthly and quarterly, all aligned to common start."""
     fig, axes = plt.subplots(1, 2, figsize=(18, 8))
     fig.suptitle("Strategy Equity Curves — Net of Transaction Costs",
                  fontsize=16, fontweight="bold", color=PALETTE["darkblue"])
 
     colors = [PALETTE["blue"], PALETTE["green"], PALETTE["orange"],
-              PALETTE["red"], "#8e44ad", "#16a085", "#2c3e50", "#d35400"]
+              PALETTE["red"], "#8e44ad", "#16a085", "#d35400", "#27ae60"]
 
-    for fi, freq in enumerate(["monthly", "quarterly"]):
-        ax = axes[fi]
+    for ax_idx, freq in enumerate(["monthly", "quarterly"]):
+        ax = axes[ax_idx]
         freq_results = [r for r in all_results if r.rebal_freq == freq]
         if not freq_results:
             continue
 
-        bm_done = False
-        for r in freq_results:
-            df = r.to_dataframe()
-            if not bm_done:
-                bm = df["benchmark"].dropna()
-                if len(bm) > 0:
-                    ax.plot((1 + bm).cumprod().index, (1 + bm).cumprod().values,
-                            color="black", linewidth=2, alpha=0.4,
-                            linestyle="--", label="MSCI EM", zorder=0)
-                    bm_done = True
+        curves = {r.factor_label: r.equity_net for r in freq_results}
 
-        for i, r in enumerate(freq_results):
-            df = r.to_dataframe()
-            cum = (1 + df["net_return"]).cumprod()
-            ax.plot(cum.index, cum.values, label=r.factor_label,
-                    linewidth=1.8, color=colors[i % len(colors)])
+        if freq_results[0].benchmark_daily_returns is not None:
+            bm = freq_results[0].benchmark_daily_returns
+            curves[BENCHMARK_NAME] = (1 + bm.fillna(0)).cumprod()
 
+        aligned = align_to_common_start(curves)
+
+        if aligned:
+            common_start = min(c.index[0] for c in aligned.values())
+            ax.text(0.02, 0.98, f"From {common_start.date()}",
+                    transform=ax.transAxes, fontsize=8,
+                    color=PALETTE["grey"], va="top")
+
+        color_idx = 0
+        for name, curve in aligned.items():
+            if name == BENCHMARK_NAME:
+                ax.plot(curve.index, curve.values, label=name,
+                        color=PALETTE["benchmark"], linewidth=2.5,
+                        linestyle="--", zorder=10)
+            else:
+                ax.plot(curve.index, curve.values, label=name,
+                        linewidth=1.8, color=colors[color_idx % len(colors)])
+                color_idx += 1
+
+        ax.axhline(1.0, color="black", linewidth=0.8, alpha=0.4)
         ax.set_title(f"{freq.title()} Rebalancing", fontsize=13)
         ax.set_ylabel("Growth of €1")
-        ax.legend(fontsize=8, loc="upper left", frameon=True)
+        ax.legend(loc="upper left", fontsize=8, frameon=True)
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("€%.2f"))
 
     plt.tight_layout()
     fig.savefig(str(save_path), dpi=200, bbox_inches="tight")
@@ -407,40 +383,51 @@ def plot_comparison(all_results, save_path):
 
 def main():
     print("=" * 80)
-    print("  STRATEGY BACKTEST v2")
+    print("  STRATEGY BACKTEST v3 — Daily Equity Curves")
     print(f"  Portfolio: €{PORTFOLIO_VALUE:,.0f}  |  Cost: €{COST_PER_TRADE:.0f}/trade")
-    print(f"  Buckets: {N_BUCKETS} → B1 = {15 // N_BUCKETS} countries  |  "
-          f"Min countries: {MIN_COUNTRIES}")
+    print(f"  Buckets: {N_BUCKETS} → B1 = top {15 // N_BUCKETS} countries")
+    print(f"  Min countries: {MIN_COUNTRIES}")
     print("=" * 80)
 
-    returns_df = load_returns(DATA_DIR)
-    benchmark = load_benchmark(PRICE_FILE)
-    print(f"\n  Returns: {returns_df['country'].nunique()} countries, "
-          f"{returns_df['date'].nunique()} dates")
-    print(f"  Benchmark: {len(benchmark)} months\n")
+    print("\nLoading daily prices...")
+    country_prices, benchmark_prices = load_daily_prices(PRICE_FILE)
+    benchmark_returns = (benchmark_prices.pct_change()
+                         if benchmark_prices is not None else None)
+    print(f"  {country_prices.shape[1]} countries, "
+          f"{country_prices.shape[0]} trading days")
+    print(f"  Date range: {country_prices.index.min().date()} to "
+          f"{country_prices.index.max().date()}")
+    print(f"  Benchmark: {'OK' if benchmark_prices is not None else 'NOT FOUND'}\n")
 
     all_results = []
 
     for fid, label, higher in STRATEGIES:
-        if not (DATA_DIR / f"factor_{fid}.csv").exists():
+        factor_file = DATA_DIR / f"factor_{fid}.csv"
+        if not factor_file.exists():
             print(f"  SKIP {label}: file not found")
             continue
 
-        factor_df = load_factor(DATA_DIR, fid)
+        factor_df = pd.read_csv(factor_file, parse_dates=["date"])
 
         for freq in ["monthly", "quarterly"]:
             print(f"  {label:35s} ({freq:9s}) ... ", end="", flush=True)
 
             try:
-                result = run_strategy(fid, label, higher,
-                                      returns_df, factor_df, benchmark, freq)
+                result = run_strategy(
+                    fid, label, higher,
+                    factor_df, country_prices, benchmark_returns,
+                    rebal_freq=freq,
+                )
                 all_results.append(result)
 
                 s = result.summary()
-                print(f"Net Sharpe={s['Net Sharpe']:.2f}, "
+                ir = s.get("Information Ratio", float("nan"))
+                ir_str = f"{ir:.2f}" if pd.notna(ir) else "N/A"
+                print(f"Net SR={s['Net Sharpe']:.2f}, "
                       f"Ret={s['Net Ann Ret']:+.1%}, "
+                      f"IR={ir_str}, "
                       f"Trades={s['Total Trades']}, "
-                      f"Cost €{s['Total Cost EUR']:,.0f}")
+                      f"€{s['Total Cost EUR']:,.0f}")
 
                 plot_strategy(result, OUTPUT_DIR / f"{fid}_{freq}.png")
 
@@ -460,84 +447,84 @@ def main():
     print("=" * 110)
 
     for freq in ["monthly", "quarterly"]:
-        sub = comp[comp["Rebal"] == freq].sort_values("Net Sharpe", ascending=False)
+        sub = comp[comp["Rebal"] == freq].sort_values(
+            "Information Ratio", ascending=False)
         if len(sub) == 0:
             continue
 
-        print(f"\n--- {freq.upper()} REBALANCING ---\n")
+        print(f"\n--- {freq.upper()} REBALANCING (sorted by Information Ratio) ---\n")
 
-        d = sub[["Factor", "Months",
-                 "Net Ann Ret", "Net Vol", "Net Sharpe", "Net Max DD",
-                 "Gross Ann Ret", "Gross Sharpe",
-                 "BM Ann Ret", "Excess Ann Ret", "Info Ratio",
-                 "Total Trades", "Total Cost EUR", "Ann Cost Drag"]].copy()
+        cols = ["Factor", "Days", "Net Ann Ret", "Net Ann Vol",
+                "Net Sharpe", "Net Max DD",
+                "Gross Ann Ret", "BM Ann Ret",
+                "Excess Ann Ret", "Information Ratio",
+                "Total Trades", "Total Cost EUR", "Cost Drag/yr"]
+        d = sub[[c for c in cols if c in sub.columns]].copy()
 
-        for c in ["Net Ann Ret", "Net Vol", "Net Max DD",
-                   "Gross Ann Ret", "BM Ann Ret", "Excess Ann Ret", "Ann Cost Drag"]:
+        for c in ["Net Ann Ret", "Net Ann Vol", "Net Max DD",
+                   "Gross Ann Ret", "BM Ann Ret", "Excess Ann Ret",
+                   "Cost Drag/yr"]:
             if c in d.columns:
                 d[c] = d[c].map(lambda x: f"{x:+.2%}" if pd.notna(x) else "N/A")
-        d["Net Sharpe"] = d["Net Sharpe"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
-        d["Gross Sharpe"] = d["Gross Sharpe"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
-        d["Info Ratio"] = d["Info Ratio"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
+        for c in ["Net Sharpe", "Information Ratio"]:
+            if c in d.columns:
+                d[c] = d[c].map(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
         d["Total Cost EUR"] = d["Total Cost EUR"].map(lambda x: f"€{x:,.0f}")
 
-        d.columns = ["Factor", "Months", "Net Ret", "Net Vol", "Net SR", "Max DD",
-                      "Gross Ret", "Grs SR", "BM Ret", "Excess", "IR",
-                      "Trades", "Cost €", "Cost/yr"]
         print(d.to_string(index=False))
 
-    # Monthly vs Quarterly
+    # Monthly vs Quarterly side-by-side
     print("\n\n--- MONTHLY vs QUARTERLY ---\n")
     print(f"  {'Factor':<30s}  "
-          f"{'--- Monthly ---':>44s}  |  {'--- Quarterly ---':>44s}")
+          f"{'--- Monthly ---':>40s}  |  {'--- Quarterly ---':>40s}")
     print(f"  {'':30s}  "
-          f"{'Net SR':>7s} {'Net Ret':>8s} {'Grs Ret':>8s} "
-          f"{'Trades':>6s} {'Cost':>8s} {'Drag/yr':>8s}"
+          f"{'Net SR':>7s} {'Net Ret':>8s} {'IR':>6s} {'Trades':>7s} {'Cost':>9s}"
           f"  |  "
-          f"{'Net SR':>7s} {'Net Ret':>8s} {'Grs Ret':>8s} "
-          f"{'Trades':>6s} {'Cost':>8s} {'Drag/yr':>8s}")
-    print("  " + "-" * 124)
+          f"{'Net SR':>7s} {'Net Ret':>8s} {'IR':>6s} {'Trades':>7s} {'Cost':>9s}")
+    print("  " + "-" * 110)
 
     for fid, label, _ in STRATEGIES:
-        m = [r for r in all_results if r.factor_id == fid and r.rebal_freq == "monthly"]
-        q = [r for r in all_results if r.factor_id == fid and r.rebal_freq == "quarterly"]
+        m = [r for r in all_results
+             if r.factor_id == fid and r.rebal_freq == "monthly"]
+        q = [r for r in all_results
+             if r.factor_id == fid and r.rebal_freq == "quarterly"]
         if not m or not q:
             continue
         ms, qs = m[0].summary(), q[0].summary()
-        print(f"  {label:<30s}  "
-              f"{ms['Net Sharpe']:>7.2f} {ms['Net Ann Ret']:>+7.1%} "
-              f"{ms['Gross Ann Ret']:>+7.1%} "
-              f"{ms['Total Trades']:>5d} €{ms['Total Cost EUR']:>6,.0f} "
-              f"{ms['Ann Cost Drag']:>+7.2%}"
-              f"  |  "
-              f"{qs['Net Sharpe']:>7.2f} {qs['Net Ann Ret']:>+7.1%} "
-              f"{qs['Gross Ann Ret']:>+7.1%} "
-              f"{qs['Total Trades']:>5d} €{qs['Total Cost EUR']:>6,.0f} "
-              f"{qs['Ann Cost Drag']:>+7.2%}")
 
-    # ---- Holdings frequency (top strategies) -----------------------------
-    print("\n\n--- B1 HOLDINGS FREQUENCY (top 4 by Net Sharpe, quarterly) ---\n")
+        def fmt(s):
+            ir = s.get("Information Ratio", float("nan"))
+            return (f"{s['Net Sharpe']:>7.2f} {s['Net Ann Ret']:>+7.1%} "
+                    f"{ir:>6.2f} "
+                    f"{s['Total Trades']:>6d} €{s['Total Cost EUR']:>7,.0f}")
+
+        print(f"  {label:<30s}  {fmt(ms)}  |  {fmt(qs)}")
+
+    # ---- Holdings frequency ----------------------------------------------
+    print("\n\n--- B1 HOLDINGS FREQUENCY (top 4 quarterly strategies by IR) ---\n")
     q_results = sorted(
         [r for r in all_results if r.rebal_freq == "quarterly"],
-        key=lambda r: r.summary()["Net Sharpe"], reverse=True)[:4]
+        key=lambda r: (r.summary().get("Information Ratio") or -999),
+        reverse=True,
+    )[:4]
 
     for r in q_results:
-        freq = r.holding_frequency()
-        total = len(r.periods)
+        freq, n_periods = r.holding_frequency()
         print(f"  {r.factor_label}:")
         for country, count in freq.most_common():
-            bar = "█" * int(count / total * 30)
-            print(f"    {country:20s} {count:3d}/{total} ({count/total:5.1%}) {bar}")
+            bar = "█" * int(count / n_periods * 30)
+            print(f"    {country:20s} {count:3d}/{n_periods} "
+                  f"({count/n_periods:5.1%}) {bar}")
         print()
 
-    # Save
+    # ---- Save ------------------------------------------------------------
     comp.to_csv(str(OUTPUT_DIR / "strategy_comparison.csv"), index=False)
     plot_comparison(all_results, OUTPUT_DIR / "all_strategies_comparison.png")
-    for r in all_results:
-        r.to_dataframe().to_csv(
-            str(OUTPUT_DIR / f"returns_{r.factor_id}_{r.rebal_freq}.csv"))
 
     print(f"\nResults saved to: {OUTPUT_DIR}/")
+    print(f"  strategy_comparison.csv         — comparison table")
+    print(f"  all_strategies_comparison.png   — aligned equity curves")
+    print(f"  <factor>_<freq>.png             — individual strategy panels")
 
 
 if __name__ == "__main__":
