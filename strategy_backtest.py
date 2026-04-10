@@ -152,7 +152,7 @@ def run_strategy(factor_id, factor_label, higher_is_better,
       3. Compute daily portfolio returns from daily prices
       4. Apply transaction costs as one-day drag on rebalancing days
     """
-    daily_returns = daily_country_prices.pct_change()
+    daily_returns = daily_country_prices.pct_change(fill_method=None)
     factor_dates = sorted(factor_df["date"].unique())
 
     if rebal_freq == "monthly":

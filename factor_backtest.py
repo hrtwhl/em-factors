@@ -550,9 +550,20 @@ class FactorBacktest:
         factor_df["date"] = pd.to_datetime(factor_df["date"])
         factor_df = factor_df.dropna(subset=["factor_value"])
 
+        # ==========================================================
+        # MASTER DATA FIX: Alignment & Continuity
+        # ==========================================================
+        # 1. Snap all fragmented dates to the end of the calendar month
+        factor_df["date"] = factor_df["date"].dt.to_period("M").dt.to_timestamp("M")
+        
+        # 2. Enforce the Global Common Start Date (Apples-to-Apples)
+        global_start = pd.to_datetime("2006-01-31")
+        factor_df = factor_df[factor_df["date"] >= global_start]
+        # ==========================================================
+
         # Daily returns
-        daily_returns = daily_country_prices.pct_change()
-        bm_daily_returns = (benchmark_daily_prices.pct_change()
+        daily_returns = daily_country_prices.pct_change(fill_method=None)
+        bm_daily_returns = (benchmark_daily_prices.pct_change(fill_method=None)
                             if benchmark_daily_prices is not None else None)
 
         factor_dates = sorted(factor_df["date"].unique())

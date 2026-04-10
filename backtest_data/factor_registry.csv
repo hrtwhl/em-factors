@@ -1,33 +1,27 @@
-"factor_id","label","higher_is_better","category","filename","returns_file"
-"trailing_pe","Trailing PE",FALSE,"Value","factor_trailing_pe.csv","returns.csv"
-"forward_pe","Forward PE",FALSE,"Value","factor_forward_pe.csv","returns.csv"
-"price_to_book","Price-to-Book",FALSE,"Value","factor_price_to_book.csv","returns.csv"
-"price_to_cf","Price-to-Cash-Flow",FALSE,"Value","factor_price_to_cf.csv","returns.csv"
-"forward_ev_ebitda","Forward EV/EBITDA",FALSE,"Value","factor_forward_ev_ebitda.csv","returns.csv"
-"price_to_sales","Price-to-Sales",FALSE,"Value","factor_price_to_sales.csv","returns.csv"
-"price_to_fcf","Price-to-Free-Cash-Flow",FALSE,"Value","factor_price_to_fcf.csv","returns.csv"
-"forward_div_yield","Forward Dividend Yield",TRUE,"Value","factor_forward_div_yield.csv","returns.csv"
-"forward_roe","Forward ROE",TRUE,"Quality","factor_forward_roe.csv","returns.csv"
-"trailing_roe","Trailing ROE",TRUE,"Quality","factor_trailing_roe.csv","returns.csv"
-"trailing_roa","Trailing ROA",TRUE,"Quality","factor_trailing_roa.csv","returns.csv"
-"profit_margin","Profit Margin",TRUE,"Quality","factor_profit_margin.csv","returns.csv"
-"mom_12m","12M Momentum",TRUE,"Momentum/Risk","factor_mom_12m.csv","returns.csv"
-"mom_6m","6M Momentum",TRUE,"Momentum/Risk","factor_mom_6m.csv","returns.csv"
-"mom_3m","3M Momentum",TRUE,"Momentum/Risk","factor_mom_3m.csv","returns.csv"
-"mom_1m","1M Momentum (Reversal)",FALSE,"Momentum/Risk","factor_mom_1m.csv","returns.csv"
-"vol_12m","12M Realized Volatility",FALSE,"Momentum/Risk","factor_vol_12m.csv","returns.csv"
-"risk_adj_mom_12m","Risk-Adjusted Momentum (12M)",TRUE,"Momentum/Risk","factor_risk_adj_mom_12m.csv","returns.csv"
-"max_dd_12m","Max Drawdown (12M)",FALSE,"Momentum/Risk","factor_max_dd_12m.csv","returns.csv"
-"beta_to_em","Beta to EM Index",FALSE,"Momentum/Risk","factor_beta_to_em.csv","returns.csv"
-"earnings_revision_3m","Earnings Revision (3M)",TRUE,"Sentiment","factor_earnings_revision_3m.csv","returns.csv"
-"sales_revision_3m","Sales Revision (3M)",TRUE,"Sentiment","factor_sales_revision_3m.csv","returns.csv"
-"cds_5y","Sovereign CDS 5Y",FALSE,"Macro","factor_cds_5y.csv","returns.csv"
-"cds_3m_change","CDS 3M Change",FALSE,"Macro","factor_cds_3m_change.csv","returns.csv"
-"bond_yield_10y","10Y Govt Bond Yield",TRUE,"Macro","factor_bond_yield_10y.csv","returns.csv"
-"real_yield_10y","Real 10Y Yield",TRUE,"Macro","factor_real_yield_10y.csv","returns.csv"
-"yield_curve","Yield Curve (10Y - Policy)",TRUE,"Macro","factor_yield_curve.csv","returns.csv"
-"carry","Carry (Policy Rate)",TRUE,"Macro","factor_carry.csv","returns.csv"
-"fx_mom_3m","FX Momentum 3M",TRUE,"Macro","factor_fx_mom_3m.csv","returns.csv"
-"fx_mom_12m","FX Momentum 12M",TRUE,"Macro","factor_fx_mom_12m.csv","returns.csv"
-"cpi_yoy","CPI YoY",FALSE,"Macro","factor_cpi_yoy.csv","returns.csv"
-"cpi_3m_change","CPI 3M Change",FALSE,"Macro","factor_cpi_3m_change.csv","returns.csv"
+factor_id,label,higher_is_better,category,filename,returns_file
+trailing_pe,Trailing PE,FALSE,Value,factor_trailing_pe.csv,returns.csv
+forward_pe,Forward PE,FALSE,Value,factor_forward_pe.csv,returns.csv
+price_to_book,Price-to-Book,FALSE,Value,factor_price_to_book.csv,returns.csv
+price_to_cf,Price-to-Cash-Flow,FALSE,Value,factor_price_to_cf.csv,returns.csv
+forward_ev_ebitda,Forward EV/EBITDA,FALSE,Value,factor_forward_ev_ebitda.csv,returns.csv
+price_to_sales,Price-to-Sales,FALSE,Value,factor_price_to_sales.csv,returns.csv
+price_to_fcf,Price-to-Free-Cash-Flow,FALSE,Value,factor_price_to_fcf.csv,returns.csv
+forward_div_yield,Forward Dividend Yield,TRUE,Value,factor_forward_div_yield.csv,returns.csv
+forward_roe,Forward ROE,TRUE,Quality,factor_forward_roe.csv,returns.csv
+trailing_roe,Trailing ROE,TRUE,Quality,factor_trailing_roe.csv,returns.csv
+trailing_roa,Trailing ROA,TRUE,Quality,factor_trailing_roa.csv,returns.csv
+profit_margin,Profit Margin,TRUE,Quality,factor_profit_margin.csv,returns.csv
+mom_12m,12M Momentum,TRUE,Momentum/Risk,factor_mom_12m.csv,returns.csv
+mom_6m,6M Momentum,TRUE,Momentum/Risk,factor_mom_6m.csv,returns.csv
+mom_3m,3M Momentum,TRUE,Momentum/Risk,factor_mom_3m.csv,returns.csv
+mom_1m,1M Momentum (Reversal),FALSE,Momentum/Risk,factor_mom_1m.csv,returns.csv
+vol_12m,12M Realized Volatility,FALSE,Momentum/Risk,factor_vol_12m.csv,returns.csv
+risk_adj_mom_12m,Risk-Adjusted Momentum (12M),TRUE,Momentum/Risk,factor_risk_adj_mom_12m.csv,returns.csv
+max_dd_12m,Max Drawdown (12M),FALSE,Momentum/Risk,factor_max_dd_12m.csv,returns.csv
+beta_to_em,Beta to EM Index,FALSE,Momentum/Risk,factor_beta_to_em.csv,returns.csv
+earnings_revision_3m,Earnings Revision (3M),TRUE,Sentiment,factor_earnings_revision_3m.csv,returns.csv
+sales_revision_3m,Sales Revision (3M),TRUE,Sentiment,factor_sales_revision_3m.csv,returns.csv
+fx_mom_3m,FX Momentum 3M,TRUE,Macro,factor_fx_mom_3m.csv,returns.csv
+fx_mom_12m,FX Momentum 12M,TRUE,Macro,factor_fx_mom_12m.csv,returns.csv
+cpi_yoy,CPI YoY,FALSE,Macro,factor_cpi_yoy.csv,returns.csv
+cpi_3m_change,CPI 3M Change,FALSE,Macro,factor_cpi_3m_change.csv,returns.csv
