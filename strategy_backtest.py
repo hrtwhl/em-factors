@@ -42,14 +42,13 @@ N_BUCKETS       = 5
 MIN_COUNTRIES   = 10
 
 STRATEGIES = [
-    ("trailing_pe",       "Trailing PE",             False),
-    ("forward_pe",        "Forward PE",              False),
-    ("price_to_fcf",      "Price-to-Free-Cash-Flow", False),
-    ("price_to_cf",       "Price-to-Cash-Flow",      False),
-    ("forward_roe",       "Forward ROE",             True),
-    ("trailing_roa",      "Trailing ROA",            True),
-    ("cpi_3m_change",     "CPI 3M Change",           False),
-    ("sales_revision_3m", "Sales Revision (3M)",     True),
+    ("profit_margin",        "Profit Margin",                True),
+    ("mom_1m",               "1M Momentum (Reversal)",       False),
+    ("trailing_roa",         "Trailing ROA",                 True),
+    ("earnings_revision_3m", "Earnings Revision (3M)",       True),
+    ("risk_adj_mom_12m",     "Risk-Adjusted Momentum (12M)", True),
+    ("cpi_3m_change",        "CPI 3M Change",                False),
+    ("forward_roe",          "Forward ROE",                  True),
 ]
 
 
