@@ -175,11 +175,8 @@ def run_strategy(factor_id, factor_label, higher_is_better,
         valid_cols = set(daily_country_prices.columns)
         fslice = fslice[fslice["country"].isin(valid_cols)]
 
-        if len(fslice) < MIN_COUNTRIES:
-            continue
-
-        # Holding period: next trading day after fdate
-        # until next trading day after the next rebalancing date
+        # --- 1. DETERMINE DATES FIRST ---
+        # We must figure out the start/end dates regardless of missing data
         next_days = daily_returns.index[daily_returns.index > fdate]
         if len(next_days) == 0:
             continue
@@ -192,7 +189,15 @@ def run_strategy(factor_id, factor_label, higher_is_better,
         else:
             end_date = None
 
-        # Rank and assign buckets
+        # --- 2. THE STALENESS FIX ---
+        if len(fslice) < MIN_COUNTRIES:
+            # If we lack data, but we already own stocks, just keep holding them!
+            if current_holdings:
+                holdings_history.append((start_date, end_date, current_holdings))
+                n_trades_per_rebal[start_date] = 0 # 0 trades = €0 cost
+            continue
+
+        # --- 3. RANK AND ASSIGN BUCKETS ---
         fslice = fslice.sort_values(
             "factor_value", ascending=not higher_is_better
         ).reset_index(drop=True)
@@ -204,9 +209,13 @@ def run_strategy(factor_id, factor_label, higher_is_better,
         new_holdings = set(fslice[fslice["bucket"] == 1]["country"])
 
         if not new_holdings:
+            # Also hold if bucket sorting fails for some reason
+            if current_holdings:
+                holdings_history.append((start_date, end_date, current_holdings))
+                n_trades_per_rebal[start_date] = 0
             continue
 
-        # Trades count
+        # --- 4. CALCULATE TRADES & COSTS ---
         if not current_holdings:
             n_trades = len(new_holdings)
         else:
